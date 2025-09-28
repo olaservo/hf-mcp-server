@@ -5,6 +5,11 @@ import { DatasetSearchTool } from './dataset-search.js';
 import { ModelDetailTool } from './model-detail.js';
 import { DatasetDetailTool } from './dataset-detail.js';
 import { PaperSummaryPrompt } from './paper-summary.js';
+import {
+	MODEL_SEARCH_TOOL_CONFIG,
+	PAPER_SEARCH_TOOL_CONFIG,
+	DATASET_SEARCH_TOOL_CONFIG
+} from './index.js';
 import type { ToolResult } from './types/tool-result.js';
 
 // ChatGPT Deep Research compatible search tool
@@ -58,29 +63,96 @@ export class DeepResearchSearchTool {
 	private modelSearchTool: ModelSearchTool;
 	private paperSearchTool: PaperSearchTool;
 	private datasetSearchTool: DatasetSearchTool;
+	private enabledToolIds: string[];
 
-	constructor(hfToken?: string) {
+	constructor(hfToken?: string, enabledToolIds: string[] = []) {
 		this.modelSearchTool = new ModelSearchTool(hfToken);
 		this.paperSearchTool = new PaperSearchTool(hfToken);
 		this.datasetSearchTool = new DatasetSearchTool(hfToken);
+		this.enabledToolIds = enabledToolIds;
+	}
+
+	private getAvailableResourceTypes(): Array<'models' | 'papers' | 'datasets'> {
+		const available: Array<'models' | 'papers' | 'datasets'> = [];
+
+		if (this.enabledToolIds.includes(MODEL_SEARCH_TOOL_CONFIG.name)) {
+			available.push('models');
+		}
+		if (this.enabledToolIds.includes(PAPER_SEARCH_TOOL_CONFIG.name)) {
+			available.push('papers');
+		}
+		if (this.enabledToolIds.includes(DATASET_SEARCH_TOOL_CONFIG.name)) {
+			available.push('datasets');
+		}
+
+		return available;
+	}
+
+	public generateDynamicDescription(): string {
+		const available = this.getAvailableResourceTypes();
+
+		if (available.length === 0) {
+			return 'No research resource types are currently available. Please enable Model Search, Paper Search, or Dataset Search tools.';
+		}
+
+		const resourceList = available.map(type => {
+			switch(type) {
+				case 'models': return '"models" for ML models';
+				case 'papers': return '"papers" for research papers';
+				case 'datasets': return '"datasets" for training data';
+			}
+		}).join(', ');
+
+		return `Search across available Hugging Face research resources (${available.join(', ')}). IMPORTANT: Include specific resource type terms in your query - use ${resourceList}. Add descriptive terms like "transformer", "vision", "NLP", "language model" to refine results.`;
 	}
 
 	async search(params: DeepResearchSearchParams): Promise<string> {
 		const results: DeepResearchSearchResult[] = [];
-		const limitPerType = 7; // Distribute results across 3 resource types
+		const available = this.getAvailableResourceTypes();
+
+		if (available.length === 0) {
+			throw new Error('No research resource search tools are currently enabled. Please enable Model Search, Paper Search, or Dataset Search tools.');
+		}
+
+		// Distribute results across available resource types
+		const limitPerType = Math.max(5, Math.floor(20 / available.length));
 
 		try {
-			// Search across core research resource types
-			const [modelResults, paperResults, datasetResults] = await Promise.all([
-				this.modelSearchTool.searchWithParams({ query: params.query, limit: limitPerType }).catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 })),
-				this.paperSearchTool.search(params.query, limitPerType).catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 })),
-				this.datasetSearchTool.searchWithParams({ query: params.query, limit: limitPerType }).catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
-			]);
+			// Search only across enabled resource types
+			const searchPromises: Promise<ToolResult>[] = [];
 
-			// Convert and aggregate results
-			results.push(...this.convertModelSearchResults(modelResults));
-			results.push(...this.convertPaperSearchResults(paperResults));
-			results.push(...this.convertDatasetSearchResults(datasetResults));
+			if (available.includes('models')) {
+				searchPromises.push(
+					this.modelSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
+						.catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
+				);
+			}
+			if (available.includes('papers')) {
+				searchPromises.push(
+					this.paperSearchTool.search(params.query, limitPerType)
+						.catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
+				);
+			}
+			if (available.includes('datasets')) {
+				searchPromises.push(
+					this.datasetSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
+						.catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
+				);
+			}
+
+			const searchResults = await Promise.all(searchPromises);
+
+			// Convert and aggregate results based on available types
+			let resultIndex = 0;
+			if (available.includes('models')) {
+				results.push(...this.convertModelSearchResults(searchResults[resultIndex++]));
+			}
+			if (available.includes('papers')) {
+				results.push(...this.convertPaperSearchResults(searchResults[resultIndex++]));
+			}
+			if (available.includes('datasets')) {
+				results.push(...this.convertDatasetSearchResults(searchResults[resultIndex++]));
+			}
 
 			const response = {
 				results: results
@@ -167,33 +239,86 @@ export class DeepResearchFetchTool {
 	private modelDetailTool: ModelDetailTool;
 	private datasetDetailTool: DatasetDetailTool;
 	private paperSummaryTool: PaperSummaryPrompt;
+	private enabledToolIds: string[];
 
-	constructor(hfToken?: string) {
+	constructor(hfToken?: string, enabledToolIds: string[] = []) {
 		this.modelDetailTool = new ModelDetailTool(hfToken);
 		this.datasetDetailTool = new DatasetDetailTool(hfToken);
 		this.paperSummaryTool = new PaperSummaryPrompt(hfToken);
+		this.enabledToolIds = enabledToolIds;
+	}
+
+	private getAvailableResourceTypes(): Array<'models' | 'papers' | 'datasets'> {
+		const available: Array<'models' | 'papers' | 'datasets'> = [];
+
+		// Check if underlying search tools are enabled (they're needed for the same resource types)
+		if (this.enabledToolIds.includes(MODEL_SEARCH_TOOL_CONFIG.name)) {
+			available.push('models');
+		}
+		if (this.enabledToolIds.includes(PAPER_SEARCH_TOOL_CONFIG.name)) {
+			available.push('papers');
+		}
+		if (this.enabledToolIds.includes(DATASET_SEARCH_TOOL_CONFIG.name)) {
+			available.push('datasets');
+		}
+
+		return available;
+	}
+
+	public generateDynamicDescription(): string {
+		const available = this.getAvailableResourceTypes();
+
+		if (available.length === 0) {
+			return 'No research resource types are currently available for fetching. Please enable Model Search, Paper Search, or Dataset Search tools.';
+		}
+
+		const examples: string[] = [];
+		if (available.includes('models')) examples.push('models (author/model-name)');
+		if (available.includes('datasets')) examples.push('datasets (author/dataset-name)');
+		if (available.includes('papers')) examples.push('papers (arXiv IDs like 2301.12345)');
+
+		return `Fetch detailed content from available Hugging Face research resources. Supports ${examples.join(', ')}. Provide exact resource identifiers or URLs.`;
 	}
 
 	async fetch(params: DeepResearchFetchParams): Promise<string> {
 		try {
 			const id = params.id;
+			const available = this.getAvailableResourceTypes();
+
+			if (available.length === 0) {
+				throw new Error('No research resource fetch capabilities are currently enabled. Please enable Model Search, Paper Search, or Dataset Search tools.');
+			}
 
 			// Determine resource type from ID/URL and fetch accordingly
 			const resourceType = this.determineResourceType(id);
 
 			switch (resourceType) {
 				case 'model':
+					if (!available.includes('models')) {
+						throw new Error('Model fetching is not available. Model Search tool is not enabled.');
+					}
 					return this.fetchModel(id);
 
 				case 'dataset':
+					if (!available.includes('datasets')) {
+						throw new Error('Dataset fetching is not available. Dataset Search tool is not enabled.');
+					}
 					return this.fetchDataset(id);
 
 				case 'paper':
+					if (!available.includes('papers')) {
+						throw new Error('Paper fetching is not available. Paper Search tool is not enabled.');
+					}
 					return this.fetchPaper(id);
 
 				default:
-					// Try to infer from the ID format if no URL was provided
-					return this.fetchUnknownResource(id);
+					const supportedFormats = [];
+					if (available.includes('models')) supportedFormats.push('- Models: author/model-name or https://huggingface.co/author/model-name');
+					if (available.includes('datasets')) supportedFormats.push('- Datasets: author/dataset-name or https://huggingface.co/datasets/author/dataset-name');
+					if (available.includes('papers')) supportedFormats.push('- Papers: 2301.12345 or https://arxiv.org/abs/2301.12345 or https://huggingface.co/papers/2301.12345');
+
+					const formatsText = supportedFormats.length > 0 ? supportedFormats.join('\n') : 'No resource types are currently available.';
+					throw new Error(`Unable to determine resource type for "${id}". Please provide a more specific URL or ID format.\n\nCurrently supported formats:\n${formatsText}`);
 			}
 		} catch (error) {
 			throw new Error(`Fetch failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -301,51 +426,6 @@ export class DeepResearchFetchTool {
 	}
 
 
-	private async fetchUnknownResource(id: string): Promise<string> {
-		// Try to infer the resource type based on ID format
-
-		// Check if it looks like a model ID (author/model format)
-		if (id.includes('/') && !id.includes(' ') && id.split('/').length === 2) {
-			try {
-				return await this.fetchModel(id);
-			} catch {
-				// If model fetch fails, try dataset
-				try {
-					return await this.fetchDataset(id);
-				} catch {
-					// Fall through to unsupported
-				}
-			}
-		}
-
-		// Check if it looks like an arXiv ID
-		if (id.match(/^\d{4}\.\d{4,5}$/)) {
-			try {
-				return await this.fetchPaper(id);
-			} catch {
-				// Fall through to unsupported
-			}
-		}
-
-		// Unsupported resource type
-		const document: DeepResearchDocument = {
-			id: id,
-			title: `Resource: ${id}`,
-			text: `This resource (${id}) could not be automatically identified. Please provide a more specific URL or ID format.
-
-Supported formats:
-- Models: author/model-name or https://huggingface.co/author/model-name
-- Datasets: author/dataset-name or https://huggingface.co/datasets/author/dataset-name
-- Papers: 2301.12345 or https://arxiv.org/abs/2301.12345 or https://huggingface.co/papers/2301.12345`,
-			url: id.startsWith('http') ? id : `https://huggingface.co/${id}`,
-			metadata: {
-				type: 'unsupported',
-				source: 'huggingface'
-			}
-		};
-
-		return JSON.stringify(document);
-	}
 
 
 	private extractCrossReferences(content: string, resourceType: string): Record<string, any> {

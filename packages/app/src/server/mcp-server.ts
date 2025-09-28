@@ -579,13 +579,13 @@ export const createServerFactory = (_webServerInstance: WebServer, sharedApiClie
 		);
 
 		// Deep Research compatible tools
+		const deepSearchTool = new DeepResearchSearchTool(hfToken, toolSelection.enabledToolIds);
 		toolInstances[DEEP_RESEARCH_SEARCH_CONFIG.name] = server.tool(
 			DEEP_RESEARCH_SEARCH_CONFIG.name,
-			DEEP_RESEARCH_SEARCH_CONFIG.description,
+			deepSearchTool.generateDynamicDescription(),
 			DEEP_RESEARCH_SEARCH_CONFIG.schema.shape,
 			DEEP_RESEARCH_SEARCH_CONFIG.annotations,
 			async (params: DeepResearchSearchParams) => {
-				const deepSearchTool = new DeepResearchSearchTool(hfToken);
 				const results = await deepSearchTool.search(params);
 				return {
 					content: [{ type: 'text', text: results }],
@@ -593,13 +593,13 @@ export const createServerFactory = (_webServerInstance: WebServer, sharedApiClie
 			}
 		);
 
+		const deepFetchTool = new DeepResearchFetchTool(hfToken, toolSelection.enabledToolIds);
 		toolInstances[DEEP_RESEARCH_FETCH_CONFIG.name] = server.tool(
 			DEEP_RESEARCH_FETCH_CONFIG.name,
-			DEEP_RESEARCH_FETCH_CONFIG.description,
+			deepFetchTool.generateDynamicDescription(),
 			DEEP_RESEARCH_FETCH_CONFIG.schema.shape,
 			DEEP_RESEARCH_FETCH_CONFIG.annotations,
 			async (params: DeepResearchFetchParams) => {
-				const deepFetchTool = new DeepResearchFetchTool(hfToken);
 				const results = await deepFetchTool.fetch(params);
 				return {
 					content: [{ type: 'text', text: results }],
