@@ -52,6 +52,12 @@ import {
 	DOC_FETCH_CONFIG,
 	DocFetchTool,
 	type DocFetchParams,
+	DEEP_RESEARCH_SEARCH_CONFIG,
+	DeepResearchSearchTool,
+	type DeepResearchSearchParams,
+	DEEP_RESEARCH_FETCH_CONFIG,
+	DeepResearchFetchTool,
+	type DeepResearchFetchParams,
 } from '@llmindset/hf-mcp';
 
 import type { ServerFactory, ServerFactoryResult } from './transport/base-transport.js';
@@ -566,6 +572,35 @@ export const createServerFactory = (_webServerInstance: WebServer, sharedApiClie
 			async (params: DocFetchParams) => {
 				const docFetch = new DocFetchTool();
 				const results = await docFetch.fetch(params);
+				return {
+					content: [{ type: 'text', text: results }],
+				};
+			}
+		);
+
+		// Deep Research compatible tools
+		toolInstances[DEEP_RESEARCH_SEARCH_CONFIG.name] = server.tool(
+			DEEP_RESEARCH_SEARCH_CONFIG.name,
+			DEEP_RESEARCH_SEARCH_CONFIG.description,
+			DEEP_RESEARCH_SEARCH_CONFIG.schema.shape,
+			DEEP_RESEARCH_SEARCH_CONFIG.annotations,
+			async (params: DeepResearchSearchParams) => {
+				const deepSearchTool = new DeepResearchSearchTool(hfToken);
+				const results = await deepSearchTool.search(params);
+				return {
+					content: [{ type: 'text', text: results }],
+				};
+			}
+		);
+
+		toolInstances[DEEP_RESEARCH_FETCH_CONFIG.name] = server.tool(
+			DEEP_RESEARCH_FETCH_CONFIG.name,
+			DEEP_RESEARCH_FETCH_CONFIG.description,
+			DEEP_RESEARCH_FETCH_CONFIG.schema.shape,
+			DEEP_RESEARCH_FETCH_CONFIG.annotations,
+			async (params: DeepResearchFetchParams) => {
+				const deepFetchTool = new DeepResearchFetchTool(hfToken);
+				const results = await deepFetchTool.fetch(params);
 				return {
 					content: [{ type: 'text', text: results }],
 				};
