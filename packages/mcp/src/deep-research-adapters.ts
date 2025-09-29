@@ -18,9 +18,9 @@ import { fetchReadmeContent } from './readme-utils.js';
 // ChatGPT Deep Research compatible search tool
 export const DEEP_RESEARCH_SEARCH_CONFIG = {
 	name: 'search',
-	description: 'Search across Hugging Face research resources (models, papers, datasets only). IMPORTANT: Include specific resource type terms in your query - use "models" or "model" for ML models, "papers" or "paper" for research papers, "datasets" or "dataset" for training data. Add descriptive terms like "transformer", "vision", "NLP", "language model" to refine results.',
+	description: 'Search across Hugging Face research resources (models, papers, datasets). Returns comprehensive results with metadata including tags, licenses, and usage statistics. IMPORTANT: Include specific resource type terms in your query - use "models" for ML models, "papers" for research papers, "datasets" for training data. Add descriptive terms like "transformer", "vision", "NLP", "language model", or specific tasks like "text-generation", "image-classification" for best results.',
 	schema: z.object({
-		query: z.string().min(1).describe('Search query - MUST include resource type keywords ("models", "papers", "datasets") and descriptive terms for best results'),
+		query: z.string().min(1).describe('Search query - MUST include resource type keywords ("models", "papers", "datasets") and descriptive terms like task types, architectures, or domains for comprehensive results with metadata'),
 	}),
 	annotations: {
 		title: 'Unified Search for Deep Research',
@@ -33,9 +33,9 @@ export const DEEP_RESEARCH_SEARCH_CONFIG = {
 // ChatGPT Deep Research compatible fetch tool
 export const DEEP_RESEARCH_FETCH_CONFIG = {
 	name: 'fetch',
-	description: 'Fetch detailed content from Hugging Face research resources. Supports models (author/model-name), datasets (author/dataset-name), and papers (arXiv IDs like 2301.12345). Provide exact resource identifiers or URLs.',
+	description: 'Fetch comprehensive details and metadata from Hugging Face research resources. Returns rich information including cross-references, related resources, tags, licenses, usage statistics, and full content. Supports models (author/model-name), datasets (author/dataset-name), and papers (arXiv IDs like 2301.12345). Accepts resource identifiers, full URLs, or shortened hf.co links.',
 	schema: z.object({
-		id: z.string().describe('Resource ID to fetch'),
+		id: z.string().describe('Resource identifier - supports author/name format, arXiv IDs, or full URLs for comprehensive resource details with cross-references'),
 	}),
 	annotations: {
 		title: 'Fetch Resource for Deep Research',
@@ -106,7 +106,7 @@ export class DeepResearchSearchTool {
 			}
 		}).join(', ');
 
-		return `Search across available Hugging Face research resources (${available.join(', ')}). IMPORTANT: Include specific resource type terms in your query - use ${resourceList}. Add descriptive terms like "transformer", "vision", "NLP", "language model" to refine results.`;
+		return `Search across available Hugging Face research resources (${available.join(', ')}) with comprehensive metadata including tags, licenses, and usage statistics. IMPORTANT: Include specific resource type terms in your query - use ${resourceList}. Add descriptive terms like "transformer", "vision", "NLP", "language model", or task types for best results.`;
 	}
 
 	async search(params: DeepResearchSearchParams): Promise<string> {
@@ -293,7 +293,7 @@ export class DeepResearchFetchTool {
 		if (available.includes('datasets')) examples.push('datasets (author/dataset-name)');
 		if (available.includes('papers')) examples.push('papers (arXiv IDs like 2301.12345)');
 
-		return `Fetch detailed content from available Hugging Face research resources. Supports ${examples.join(', ')}. Provide exact resource identifiers or URLs.`;
+		return `Fetch comprehensive details and metadata from available Hugging Face research resources, including cross-references, related resources, tags, licenses, and usage statistics. Supports ${examples.join(', ')}. Accepts resource identifiers, full URLs, or hf.co links.`;
 	}
 
 	async fetch(params: DeepResearchFetchParams): Promise<string> {
