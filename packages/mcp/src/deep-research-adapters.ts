@@ -110,8 +110,10 @@ export class DeepResearchSearchTool {
 	}
 
 	async search(params: DeepResearchSearchParams): Promise<string> {
+		console.log(`[DeepResearchSearch] Starting search for query: "${params.query}"`);
 		const results: DeepResearchSearchResult[] = [];
 		const available = this.getAvailableResourceTypes();
+		console.log(`[DeepResearchSearch] Available resource types:`, available);
 
 		if (available.length === 0) {
 			throw new Error('No research resource search tools are currently enabled. Please enable Model Search, Paper Search, or Dataset Search tools.');
@@ -119,12 +121,14 @@ export class DeepResearchSearchTool {
 
 		// Distribute results across available resource types
 		const limitPerType = Math.max(5, Math.floor(20 / available.length));
+		console.log(`[DeepResearchSearch] Limit per type: ${limitPerType}`);
 
 		try {
 			// Search only across enabled resource types and collect results
 			const searchTasks: Array<{ type: 'models' | 'papers' | 'datasets', promise: Promise<ToolResult> }> = [];
 
 			if (available.includes('models')) {
+				console.log(`[DeepResearchSearch] Adding models search task`);
 				searchTasks.push({
 					type: 'models',
 					promise: this.modelSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
@@ -132,6 +136,7 @@ export class DeepResearchSearchTool {
 				});
 			}
 			if (available.includes('papers')) {
+				console.log(`[DeepResearchSearch] Adding papers search task`);
 				searchTasks.push({
 					type: 'papers',
 					promise: this.paperSearchTool.search(params.query, limitPerType)
@@ -139,6 +144,7 @@ export class DeepResearchSearchTool {
 				});
 			}
 			if (available.includes('datasets')) {
+				console.log(`[DeepResearchSearch] Adding datasets search task`);
 				searchTasks.push({
 					type: 'datasets',
 					promise: this.datasetSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
@@ -146,25 +152,34 @@ export class DeepResearchSearchTool {
 				});
 			}
 
+			console.log(`[DeepResearchSearch] Executing ${searchTasks.length} search tasks`);
 			const searchResults = await Promise.all(searchTasks.map(task => task.promise));
 
 			// Convert and aggregate results based on actual task order
 			for (let i = 0; i < searchTasks.length; i++) {
 				const task = searchTasks[i];
 				const result = searchResults[i];
+				console.log(`[DeepResearchSearch] Processing ${task?.type} results:`, {
+					totalResults: result?.totalResults,
+					resultsShared: result?.resultsShared,
+					formattedLength: result?.formatted?.length
+				});
 
 				if (task && result) {
+					let convertedResults: DeepResearchSearchResult[] = [];
 					switch (task.type) {
 						case 'models':
-							results.push(...this.convertModelSearchResults(result));
+							convertedResults = this.convertModelSearchResults(result);
 							break;
 						case 'papers':
-							results.push(...this.convertPaperSearchResults(result));
+							convertedResults = this.convertPaperSearchResults(result);
 							break;
 						case 'datasets':
-							results.push(...this.convertDatasetSearchResults(result));
+							convertedResults = this.convertDatasetSearchResults(result);
 							break;
 					}
+					console.log(`[DeepResearchSearch] Converted ${task.type} results: ${convertedResults.length} items`);
+					results.push(...convertedResults);
 				}
 			}
 
@@ -172,8 +187,10 @@ export class DeepResearchSearchTool {
 				results: results
 			};
 
+			console.log(`[DeepResearchSearch] Final response: ${results.length} total results`);
 			return JSON.stringify(response);
 		} catch (error) {
+			console.error(`[DeepResearchSearch] Search failed:`, error);
 			throw new Error(`Search failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
 		}
 	}
@@ -183,19 +200,33 @@ export class DeepResearchSearchTool {
 		const results: DeepResearchSearchResult[] = [];
 		const lines = toolResult.formatted.split('\n');
 
+		let currentTitle = '';
+		let currentUrl = '';
+		let currentId = '';
+
 		for (const line of lines) {
-			// Look for model links in format [model-name](https://huggingface.co/...)
-			const linkMatch = line.match(/\[([^\]]+)\]\((https:\/\/huggingface\.co\/[^)]+)\)/);
-			if (linkMatch && linkMatch[1] && linkMatch[2]) {
-				const title = linkMatch[1];
-				const url = linkMatch[2];
-				const id = url.split('/').slice(-1)[0] || title;
+			// Look for model title headers (## model-id)
+			const titleMatch = line.match(/^## (.+)$/);
+			if (titleMatch && titleMatch[1]) {
+				currentTitle = titleMatch[1].trim();
+			}
+
+			// Look for model links - support both hf.co and huggingface.co formats
+			const linkMatch = line.match(/\*\*Link:\*\* \[(https:\/\/(?:hf\.co|huggingface\.co)\/[^)]+)\]\((https:\/\/(?:hf\.co|huggingface\.co)\/[^)]+)\)/);
+			if (linkMatch && linkMatch[1] && linkMatch[2] && currentTitle) {
+				currentUrl = linkMatch[2];
+				currentId = currentTitle; // For models, the title IS the model ID
 
 				results.push({
-					id,
-					title: title.trim(),
-					url: url.trim()
+					id: currentId,
+					title: currentTitle,
+					url: currentUrl
 				});
+
+				// Reset for next model
+				currentTitle = '';
+				currentUrl = '';
+				currentId = '';
 			}
 		}
 
@@ -203,25 +234,57 @@ export class DeepResearchSearchTool {
 	}
 
 	private convertPaperSearchResults(toolResult: ToolResult): DeepResearchSearchResult[] {
+		console.log(`[DeepResearchSearch] Converting paper search results. Input length: ${toolResult.formatted.length}`);
 		const results: DeepResearchSearchResult[] = [];
 		const lines = toolResult.formatted.split('\n');
+		console.log(`[DeepResearchSearch] Paper search has ${lines.length} lines to process`);
 
-		for (const line of lines) {
-			// Look for paper links
-			const linkMatch = line.match(/\[([^\]]+)\]\((https:\/\/huggingface\.co\/papers\/[^)]+)\)/);
+		let currentTitle = '';
+		let currentUrl = '';
+		let currentId = '';
+
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i];
+			if (!line) continue;
+
+			// Look for paper title headers (## Title)
+			const titleMatch = line.match(/^## (.+)$/);
+			if (titleMatch && titleMatch[1]) {
+				currentTitle = titleMatch[1].trim();
+				console.log(`[DeepResearchSearch] Found paper title: "${currentTitle}"`);
+			}
+
+			// Look for paper links - support both hf.co and huggingface.co formats
+			const linkMatch = line.match(/\*\*Link to paper:\*\* \[(https:\/\/(?:hf\.co|huggingface\.co)\/papers\/[^)]+)\]\((https:\/\/(?:hf\.co|huggingface\.co)\/papers\/[^)]+)\)/);
 			if (linkMatch && linkMatch[1] && linkMatch[2]) {
-				const title = linkMatch[1];
-				const url = linkMatch[2];
-				const id = url.split('/').slice(-1)[0] || title;
+				console.log(`[DeepResearchSearch] Found paper link: "${linkMatch[2]}" for title: "${currentTitle}"`);
+				if (currentTitle) {
+					currentUrl = linkMatch[2];
+					currentId = currentUrl.split('/').slice(-1)[0] || currentTitle;
 
-				results.push({
-					id,
-					title: title.trim(),
-					url: url.trim()
-				});
+					results.push({
+						id: currentId,
+						title: currentTitle,
+						url: currentUrl
+					});
+
+					console.log(`[DeepResearchSearch] Added paper result: ${currentId}`);
+
+					// Reset for next paper
+					currentTitle = '';
+					currentUrl = '';
+					currentId = '';
+				} else {
+					console.log(`[DeepResearchSearch] Found link but no current title`);
+				}
 			}
 		}
 
+		console.log(`[DeepResearchSearch] Paper conversion complete: ${results.length} results`);
+		// Log a sample of the input for debugging
+		if (toolResult.formatted.length > 0) {
+			console.log(`[DeepResearchSearch] Sample paper input:`, toolResult.formatted.substring(0, 500) + '...');
+		}
 		return results;
 	}
 
@@ -230,18 +293,33 @@ export class DeepResearchSearchTool {
 		const results: DeepResearchSearchResult[] = [];
 		const lines = toolResult.formatted.split('\n');
 
+		let currentTitle = '';
+		let currentUrl = '';
+		let currentId = '';
+
 		for (const line of lines) {
-			// Look for dataset links
-			const linkMatch = line.match(/\[([^\]]+)\]\((https:\/\/huggingface\.co\/datasets\/[^)]+)\)/);
-			if (linkMatch && linkMatch[1] && linkMatch[2]) {
-				const title = linkMatch[1];
-				const url = linkMatch[2];
-				const id = url.split('/').slice(-1)[0] || title; // Use dataset name as ID
+			// Look for dataset title headers (## dataset-id)
+			const titleMatch = line.match(/^## (.+)$/);
+			if (titleMatch && titleMatch[1]) {
+				currentTitle = titleMatch[1].trim();
+			}
+
+			// Look for dataset links - support both hf.co and huggingface.co formats
+			const linkMatch = line.match(/\*\*Link:\*\* \[(https:\/\/(?:hf\.co|huggingface\.co)\/datasets\/[^)]+)\]\((https:\/\/(?:hf\.co|huggingface\.co)\/datasets\/[^)]+)\)/);
+			if (linkMatch && linkMatch[1] && linkMatch[2] && currentTitle) {
+				currentUrl = linkMatch[2];
+				currentId = currentTitle; // For datasets, the title IS the dataset ID
+
 				results.push({
-					id,
-					title: title.trim(),
-					url: url.trim()
+					id: currentId,
+					title: currentTitle,
+					url: currentUrl
 				});
+
+				// Reset for next dataset
+				currentTitle = '';
+				currentUrl = '';
+				currentId = '';
 			}
 		}
 
