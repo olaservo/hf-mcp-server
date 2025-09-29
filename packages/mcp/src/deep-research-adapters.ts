@@ -11,6 +11,9 @@ import {
 	DATASET_SEARCH_TOOL_CONFIG
 } from './index.js';
 import type { ToolResult } from './types/tool-result.js';
+import { modelInfo, datasetInfo } from '@huggingface/hub';
+import { formatNumber } from './utilities.js';
+import { fetchReadmeContent } from './readme-utils.js';
 
 // ChatGPT Deep Research compatible search tool
 export const DEEP_RESEARCH_SEARCH_CONFIG = {
@@ -118,40 +121,51 @@ export class DeepResearchSearchTool {
 		const limitPerType = Math.max(5, Math.floor(20 / available.length));
 
 		try {
-			// Search only across enabled resource types
-			const searchPromises: Promise<ToolResult>[] = [];
+			// Search only across enabled resource types and collect results
+			const searchTasks: Array<{ type: 'models' | 'papers' | 'datasets', promise: Promise<ToolResult> }> = [];
 
 			if (available.includes('models')) {
-				searchPromises.push(
-					this.modelSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
+				searchTasks.push({
+					type: 'models',
+					promise: this.modelSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
 						.catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
-				);
+				});
 			}
 			if (available.includes('papers')) {
-				searchPromises.push(
-					this.paperSearchTool.search(params.query, limitPerType)
+				searchTasks.push({
+					type: 'papers',
+					promise: this.paperSearchTool.search(params.query, limitPerType)
 						.catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
-				);
+				});
 			}
 			if (available.includes('datasets')) {
-				searchPromises.push(
-					this.datasetSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
+				searchTasks.push({
+					type: 'datasets',
+					promise: this.datasetSearchTool.searchWithParams({ query: params.query, limit: limitPerType })
 						.catch(() => ({ formatted: '', totalResults: 0, resultsShared: 0 }))
-				);
+				});
 			}
 
-			const searchResults = await Promise.all(searchPromises);
+			const searchResults = await Promise.all(searchTasks.map(task => task.promise));
 
-			// Convert and aggregate results based on available types
-			let resultIndex = 0;
-			if (available.includes('models')) {
-				results.push(...this.convertModelSearchResults(searchResults[resultIndex++]));
-			}
-			if (available.includes('papers')) {
-				results.push(...this.convertPaperSearchResults(searchResults[resultIndex++]));
-			}
-			if (available.includes('datasets')) {
-				results.push(...this.convertDatasetSearchResults(searchResults[resultIndex++]));
+			// Convert and aggregate results based on actual task order
+			for (let i = 0; i < searchTasks.length; i++) {
+				const task = searchTasks[i];
+				const result = searchResults[i];
+
+				if (task && result) {
+					switch (task.type) {
+						case 'models':
+							results.push(...this.convertModelSearchResults(result));
+							break;
+						case 'papers':
+							results.push(...this.convertPaperSearchResults(result));
+							break;
+						case 'datasets':
+							results.push(...this.convertDatasetSearchResults(result));
+							break;
+					}
+				}
 			}
 
 			const response = {
@@ -240,12 +254,14 @@ export class DeepResearchFetchTool {
 	private datasetDetailTool: DatasetDetailTool;
 	private paperSummaryTool: PaperSummaryPrompt;
 	private enabledToolIds: string[];
+	private hfToken?: string;
 
 	constructor(hfToken?: string, enabledToolIds: string[] = []) {
 		this.modelDetailTool = new ModelDetailTool(hfToken);
 		this.datasetDetailTool = new DatasetDetailTool(hfToken);
 		this.paperSummaryTool = new PaperSummaryPrompt(hfToken);
 		this.enabledToolIds = enabledToolIds;
+		this.hfToken = hfToken;
 	}
 
 	private getAvailableResourceTypes(): Array<'models' | 'papers' | 'datasets'> {
@@ -350,10 +366,17 @@ export class DeepResearchFetchTool {
 		const modelId = id.includes('huggingface.co/') ?
 			id.split('huggingface.co/')[1]?.split('?')[0] || id : id;
 
-		const result = await this.modelDetailTool.getDetails(modelId, true);
+		// Get both structured data and formatted result
+		const [modelData, result] = await Promise.all([
+			this.getModelStructuredData(modelId),
+			this.modelDetailTool.getDetails(modelId, true)
+		]);
 
-		// Extract metadata from the formatted result for cross-references
-		const crossRefs = this.extractCrossReferences(result.formatted, 'model');
+		// Extract metadata from structured API data (much more reliable)
+		let crossRefs = this.extractModelCrossReferences(modelData);
+
+		// Enrich with YAML frontmatter if API data is incomplete
+		crossRefs = await this.enrichWithYamlFrontmatter(crossRefs, modelId, 'models');
 
 		const document: DeepResearchDocument = {
 			id: modelId,
@@ -377,10 +400,17 @@ export class DeepResearchFetchTool {
 		const datasetId = id.includes('huggingface.co/datasets/') ?
 			id.split('datasets/')[1]?.split('?')[0] || id : id;
 
-		const result = await this.datasetDetailTool.getDetails(datasetId, true);
+		// Get both structured data and formatted result
+		const [datasetData, result] = await Promise.all([
+			this.getDatasetStructuredData(datasetId),
+			this.datasetDetailTool.getDetails(datasetId, true)
+		]);
 
-		// Extract metadata from the formatted result for cross-references
-		const crossRefs = this.extractCrossReferences(result.formatted, 'dataset');
+		// Extract metadata from structured API data (much more reliable)
+		let crossRefs = this.extractDatasetCrossReferences(datasetData);
+
+		// Enrich with YAML frontmatter if API data is incomplete
+		crossRefs = await this.enrichWithYamlFrontmatter(crossRefs, datasetId, 'datasets');
 
 		const document: DeepResearchDocument = {
 			id: datasetId,
@@ -428,41 +458,285 @@ export class DeepResearchFetchTool {
 
 
 
-	private extractCrossReferences(content: string, resourceType: string): Record<string, any> {
+	/**
+	 * Get structured model data directly from Hugging Face API
+	 */
+	private async getModelStructuredData(modelId: string): Promise<any> {
+		try {
+			const additionalFields = [
+				'author',
+				'downloadsAllTime',
+				'library_name',
+				'tags',
+				'cardData',
+				'spaces'
+			] as const;
+
+			return await modelInfo<(typeof additionalFields)[number]>({
+				name: modelId,
+				additionalFields: Array.from(additionalFields),
+				...(this.hfToken && {
+					credentials: { accessToken: this.hfToken }
+				})
+			});
+		} catch (error) {
+			console.warn(`Failed to get structured model data for ${modelId}:`, error);
+			return null;
+		}
+	}
+
+	/**
+	 * Get structured dataset data directly from Hugging Face API
+	 */
+	private async getDatasetStructuredData(datasetId: string): Promise<any> {
+		try {
+			const additionalFields = [
+				'author',
+				'downloadsAllTime',
+				'tags',
+				'description',
+				'cardData'
+			] as const;
+
+			return await datasetInfo<(typeof additionalFields)[number]>({
+				name: datasetId,
+				additionalFields: Array.from(additionalFields),
+				...(this.hfToken && {
+					credentials: { accessToken: this.hfToken }
+				})
+			});
+		} catch (error) {
+			console.warn(`Failed to get structured dataset data for ${datasetId}:`, error);
+			return null;
+		}
+	}
+
+	/**
+	 * Extract cross-references from structured model data
+	 */
+	private extractModelCrossReferences(modelData: any): Record<string, any> {
 		const crossRefs: Record<string, any> = {};
 
-		// Extract paper references (arXiv IDs)
-		const paperMatches = content.match(/\b((?:19|20)\d{2}\.\d{4,5})\b/g);
-		if (paperMatches) {
-			crossRefs.related_papers = [...new Set(paperMatches)].slice(0, 3);
+		if (!modelData) return crossRefs;
+
+		// Use structured tags (much more reliable than regex)
+		if (modelData.tags && Array.isArray(modelData.tags)) {
+			crossRefs.tags = modelData.tags.slice(0, 5);
 		}
 
-		// Extract model references (author/model format)
-		const modelMatches = content.match(/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+/g);
-		if (modelMatches && resourceType !== 'model') {
-			crossRefs.related_models = [...new Set(modelMatches)]
-				.filter(ref => !ref.includes('.') || ref.includes('-'))
-				.slice(0, 3);
+		// Use structured cardData for metadata
+		if (modelData.cardData) {
+			const cardData = modelData.cardData;
+
+			// License from structured data
+			if (cardData.license) {
+				crossRefs.license = Array.isArray(cardData.license)
+					? cardData.license.join(', ')
+					: cardData.license;
+			}
+
+			// Related datasets from structured data
+			if (cardData.datasets) {
+				crossRefs.related_datasets = Array.isArray(cardData.datasets)
+					? cardData.datasets.slice(0, 3)
+					: [cardData.datasets];
+			}
+
+			// Fine-tuned from (related model)
+			if (cardData.finetuned_from) {
+				crossRefs.related_models = [cardData.finetuned_from];
+			}
 		}
 
-		// Extract tags from content
-		const tagMatches = content.match(/#([a-zA-Z0-9_-]+)/g);
-		if (tagMatches) {
-			crossRefs.tags = [...new Set(tagMatches.map(tag => tag.substring(1)))].slice(0, 5);
+		// Use structured stats (exact numbers, not regex-parsed)
+		if (modelData.downloadsAllTime) {
+			crossRefs.downloads = formatNumber(modelData.downloadsAllTime);
+		}
+		if (modelData.likes) {
+			crossRefs.likes = modelData.likes.toString();
 		}
 
-		// Extract license information
-		const licenseMatch = content.match(/license[:\s]+([a-zA-Z0-9\s-]+)/i);
-		if (licenseMatch && licenseMatch[1]) {
-			crossRefs.license = licenseMatch[1].trim();
+		// Related spaces from structured data
+		if (modelData.spaces && Array.isArray(modelData.spaces) && modelData.spaces.length > 0) {
+			crossRefs.related_spaces = modelData.spaces.slice(0, 3);
 		}
-
-		// Extract download/like counts if present
-		const downloadMatch = content.match(/(\d+(?:\.\d+)?[KMB]?)\s*downloads?/i);
-		const likeMatch = content.match(/(\d+(?:\.\d+)?[KMB]?)\s*likes?/i);
-		if (downloadMatch && downloadMatch[1]) crossRefs.downloads = downloadMatch[1];
-		if (likeMatch && likeMatch[1]) crossRefs.likes = likeMatch[1];
 
 		return crossRefs;
+	}
+
+	/**
+	 * Extract cross-references from structured dataset data
+	 */
+	private extractDatasetCrossReferences(datasetData: any): Record<string, any> {
+		const crossRefs: Record<string, any> = {};
+
+		if (!datasetData) return crossRefs;
+
+		// Use structured tags
+		if (datasetData.tags && Array.isArray(datasetData.tags)) {
+			crossRefs.tags = datasetData.tags.slice(0, 5);
+		}
+
+		// Use structured cardData for metadata
+		if (datasetData.cardData) {
+			const cardData = datasetData.cardData;
+
+			// License from structured data
+			if (cardData.license) {
+				crossRefs.license = Array.isArray(cardData.license)
+					? cardData.license.join(', ')
+					: cardData.license;
+			}
+
+			// Task categories
+			if (cardData.task_categories) {
+				crossRefs.task_categories = Array.isArray(cardData.task_categories)
+					? cardData.task_categories
+					: [cardData.task_categories];
+			}
+
+			// Size categories
+			if (cardData.size_categories) {
+				crossRefs.size_categories = Array.isArray(cardData.size_categories)
+					? cardData.size_categories
+					: [cardData.size_categories];
+			}
+
+			// Language information
+			if (cardData.language) {
+				crossRefs.language = Array.isArray(cardData.language)
+					? cardData.language
+					: [cardData.language];
+			}
+		}
+
+		// Use structured stats
+		if (datasetData.downloadsAllTime) {
+			crossRefs.downloads = formatNumber(datasetData.downloadsAllTime);
+		}
+		if (datasetData.likes) {
+			crossRefs.likes = datasetData.likes.toString();
+		}
+
+		return crossRefs;
+	}
+
+	/**
+	 * Parse YAML frontmatter from README content as fallback for missing API data
+	 */
+	private async enrichWithYamlFrontmatter(
+		crossRefs: Record<string, any>,
+		resourceId: string,
+		resourceType: 'models' | 'datasets'
+	): Promise<Record<string, any>> {
+		try {
+			// Fetch README with YAML frontmatter preserved
+			const readmeWithYaml = await fetchReadmeContent(resourceId, resourceType, true);
+			if (!readmeWithYaml) return crossRefs;
+
+			// Extract YAML frontmatter
+			const yamlData = this.parseYamlFrontmatter(readmeWithYaml);
+			if (!yamlData) return crossRefs;
+
+			// Merge YAML data with existing cross-references (API data takes precedence)
+			const enrichedRefs = { ...crossRefs };
+
+			// Add tags if not already present from API
+			if (!enrichedRefs.tags && yamlData.tags) {
+				enrichedRefs.tags = Array.isArray(yamlData.tags) ? yamlData.tags : [yamlData.tags];
+			}
+
+			// Add license if not already present
+			if (!enrichedRefs.license && yamlData.license) {
+				enrichedRefs.license = yamlData.license;
+			}
+
+			// Add language info if not already present
+			if (!enrichedRefs.language && yamlData.language) {
+				enrichedRefs.language = Array.isArray(yamlData.language) ? yamlData.language : [yamlData.language];
+			}
+
+			// For models: add base_model or finetuned_from as related models
+			if (resourceType === 'models') {
+				if (!enrichedRefs.related_models && (yamlData.base_model || yamlData.finetuned_from)) {
+					enrichedRefs.related_models = [yamlData.base_model || yamlData.finetuned_from];
+				}
+
+				// Add datasets if not already present
+				if (!enrichedRefs.related_datasets && yamlData.datasets) {
+					enrichedRefs.related_datasets = Array.isArray(yamlData.datasets)
+						? yamlData.datasets.slice(0, 3)
+						: [yamlData.datasets];
+				}
+			}
+
+			// For datasets: add task categories and size categories if not present
+			if (resourceType === 'datasets') {
+				if (!enrichedRefs.task_categories && yamlData.task_categories) {
+					enrichedRefs.task_categories = Array.isArray(yamlData.task_categories)
+						? yamlData.task_categories
+						: [yamlData.task_categories];
+				}
+
+				if (!enrichedRefs.size_categories && yamlData.size_categories) {
+					enrichedRefs.size_categories = Array.isArray(yamlData.size_categories)
+						? yamlData.size_categories
+						: [yamlData.size_categories];
+				}
+			}
+
+			return enrichedRefs;
+		} catch (error) {
+			console.warn(`Failed to enrich with YAML frontmatter for ${resourceId}:`, error);
+			return crossRefs;
+		}
+	}
+
+	/**
+	 * Parse YAML frontmatter from markdown content
+	 */
+	private parseYamlFrontmatter(content: string): Record<string, any> | null {
+		try {
+			// Match YAML frontmatter: starts with ---, ends with ---
+			const yamlPattern = /^(\s*---[\r\n]+)([\S\s]*?)([\r\n]+---(\r\n|\n|$))/;
+			const match = content.match(yamlPattern);
+
+			if (!match || !match[2]) return null;
+
+			const yamlContent = match[2].trim();
+
+			// Simple YAML parser for common key-value patterns
+			// This is basic but should handle most model card YAML
+			const yamlData: Record<string, any> = {};
+			const lines = yamlContent.split('\n');
+
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (!trimmed || trimmed.startsWith('#')) continue;
+
+				// Handle key: value pairs
+				const keyValueMatch = trimmed.match(/^([^:]+):\s*(.*)$/);
+				if (keyValueMatch && keyValueMatch[1] && keyValueMatch[2] !== undefined) {
+					const key = keyValueMatch[1].trim();
+					let value: string | string[] = keyValueMatch[2].trim();
+
+					// Handle arrays (simple format: [item1, item2] or - item)
+					if (value.startsWith('[') && value.endsWith(']')) {
+						value = value.slice(1, -1).split(',').map(v => v.trim().replace(/['"]/g, ''));
+					} else if (value.startsWith('"') && value.endsWith('"')) {
+						value = value.slice(1, -1);
+					} else if (value.startsWith("'") && value.endsWith("'")) {
+						value = value.slice(1, -1);
+					}
+
+					yamlData[key] = value;
+				}
+			}
+
+			return Object.keys(yamlData).length > 0 ? yamlData : null;
+		} catch (error) {
+			console.warn('Failed to parse YAML frontmatter:', error);
+			return null;
+		}
 	}
 }
