@@ -18,14 +18,27 @@ interface BaseSkillResourceContent {
 export type SkillResourceContent =
 	(BaseSkillResourceContent & { text: string }) | (BaseSkillResourceContent & { blob: string });
 
+/**
+ * Every result carries `resultType: "complete"` (protocol 2026-07-28, SEP-2322): these methods
+ * never need a multi round-trip, and a paginated page is still a complete result for that page.
+ */
+export const COMPLETE_RESULT = 'complete' as const;
+
 interface SkillDirectoryListing {
+	resultType: typeof COMPLETE_RESULT;
 	resources: { uri: string; name: string; mimeType: string }[];
 	nextCursor?: string;
 }
 
 export interface SkillListResult {
+	resultType: typeof COMPLETE_RESULT;
 	skills: SkillProtocolEntry[];
 	nextCursor?: string;
+}
+
+export interface SkillGetResult {
+	resultType: typeof COMPLETE_RESULT;
+	skill: SkillProtocolEntry;
 }
 
 export function toProtocolEntry(entry: SkillEntry): SkillProtocolEntry {
@@ -75,14 +88,15 @@ export function listSkills(
 	const page = catalog.entries.slice(offset, offset + pageSize);
 	const nextOffset = offset + page.length;
 	return {
+		resultType: COMPLETE_RESULT,
 		skills: page.map(toProtocolEntry),
 		...(nextOffset < catalog.entries.length ? { nextCursor: String(nextOffset) } : {}),
 	};
 }
 
-export function getSkill(catalog: SkillCatalog, uri: string): SkillProtocolEntry | null {
+export function getSkill(catalog: SkillCatalog, uri: string): SkillGetResult | null {
 	const entry = catalog.entriesByUri.get(uri);
-	return entry ? toProtocolEntry(entry) : null;
+	return entry ? { resultType: COMPLETE_RESULT, skill: toProtocolEntry(entry) } : null;
 }
 
 export function readSkillDirectory(
@@ -101,6 +115,7 @@ export function readSkillDirectory(
 	const page = children.slice(offset, offset + pageSize);
 	const nextOffset = offset + page.length;
 	return {
+		resultType: COMPLETE_RESULT,
 		resources: page.map((child) => ({ uri: child.uri, name: child.name, mimeType: child.mimeType })),
 		...(nextOffset < children.length ? { nextCursor: String(nextOffset) } : {}),
 	};

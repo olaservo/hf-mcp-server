@@ -59,11 +59,11 @@ export function registerSkillResources(
 	);
 
 	server.server.setRequestHandler(SKILLS_GET_METHOD, { params: SkillsGetParamsSchema }, ({ uri }): ServerResult => {
-		const skill = getSkill(catalog, uri);
-		if (!skill) {
+		const result = getSkill(catalog, uri);
+		if (!result) {
 			throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown skill URI: ${uri}`);
 		}
-		return { skill } as ServerResult;
+		return result as ServerResult;
 	});
 
 	server.server.setRequestHandler(

@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { loadSkills } from '../../src/server/skills/skill-loader.js';
+import { loadSkills, SKILL_MAX_RESOURCES, SKILL_MAX_TOTAL_BYTES } from '../../src/server/skills/skill-loader.js';
+import { logger } from '../../src/server/utils/logger.js';
 
 let root: string;
 
@@ -16,11 +17,18 @@ interface FixtureFile {
 	content: Buffer | string;
 }
 
-async function writeSkill(
-	name = 'alpha',
-	files: FixtureFile[] = [{ relativePath: 'references/guide.md', content: '# guide\n' }],
-	frontmatter: Record<string, unknown> = { name, description: 'first skill' }
-): Promise<void> {
+interface SkillFixture {
+	name: string;
+	files?: FixtureFile[];
+	frontmatter?: Record<string, unknown>;
+	/** Emit `size` on each manifest entry, as a SEP-2640 Final snapshot does. */
+	withSize?: boolean;
+}
+
+async function writeSkillFiles(fixture: SkillFixture): Promise<Record<string, unknown>> {
+	const { name, withSize = false } = fixture;
+	const frontmatter = fixture.frontmatter ?? { name, description: 'first skill' };
+	const files = fixture.files ?? [{ relativePath: 'references/guide.md', content: '# guide\n' }];
 	const skillDir = path.join(root, name);
 	await mkdir(skillDir, { recursive: true });
 	const skillMd = `---\nname: ${String(frontmatter.name)}\ndescription: ${String(frontmatter.description)}\n---\n\n# ${name}\n`;
@@ -30,21 +38,29 @@ async function writeSkill(
 		await mkdir(path.dirname(target), { recursive: true });
 		await writeFile(target, file.content);
 	}
-	await writeFile(
-		path.join(root, 'skills.json'),
-		JSON.stringify({
-			skills: [
-				{
-					uri: `skill://${name}/SKILL.md`,
-					frontmatter,
-					resources: allFiles.map((file) => ({
-						uri: `skill://${name}/${file.relativePath.split('/').map(encodeURIComponent).join('/')}`,
-						digest: digest(file.content),
-					})),
-				},
-			],
-		})
-	);
+	return {
+		uri: `skill://${name}/SKILL.md`,
+		frontmatter,
+		resources: allFiles.map((file) => ({
+			uri: `skill://${name}/${file.relativePath.split('/').map(encodeURIComponent).join('/')}`,
+			digest: digest(file.content),
+			...(withSize ? { size: Buffer.byteLength(file.content) } : {}),
+		})),
+	};
+}
+
+async function writeSkills(fixtures: SkillFixture[]): Promise<void> {
+	const skills: Record<string, unknown>[] = [];
+	for (const fixture of fixtures) skills.push(await writeSkillFiles(fixture));
+	await writeFile(path.join(root, 'skills.json'), JSON.stringify({ skills }));
+}
+
+async function writeSkill(
+	name = 'alpha',
+	files: FixtureFile[] = [{ relativePath: 'references/guide.md', content: '# guide\n' }],
+	frontmatter: Record<string, unknown> = { name, description: 'first skill' }
+): Promise<void> {
+	await writeSkills([{ name, files, frontmatter }]);
 }
 
 async function mutateManifest(mutator: (manifest: Record<string, unknown>) => void): Promise<void> {
@@ -61,6 +77,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await rm(root, { recursive: true, force: true });
 });
 
@@ -87,6 +104,136 @@ describe('loadSkills', () => {
 			name: 'references',
 			mimeType: 'inode/directory',
 		});
+	});
+
+	it('emits the verified byte size on every manifest resource', async () => {
+		const binary = Buffer.from([0x00, 0xff, 0x10, 0x20]);
+		await writeSkills([
+			{
+				name: 'alpha',
+				files: [
+					{ relativePath: 'references/guide.md', content: '# guide\r\n' },
+					{ relativePath: 'assets/raw.bin', content: binary },
+				],
+				withSize: true,
+			},
+		]);
+
+		const catalog = await loadSkills(root);
+		const resources = catalog.entries[0]!.resources;
+		expect(resources).toHaveLength(3);
+		for (const resource of resources) {
+			expect(resource).toEqual({
+				uri: resource.uri,
+				digest: resource.digest,
+				size: catalog.resourcesByUri.get(resource.uri)!.bytes.length,
+			});
+		}
+		expect(resources.find((resource) => resource.uri.endsWith('/raw.bin'))?.size).toBe(4);
+		expect(resources.find((resource) => resource.uri.endsWith('/guide.md'))?.size).toBe(9);
+	});
+
+	it('fills size in from the verified bytes when an older manifest omits it', async () => {
+		await writeSkill('alpha', [{ relativePath: 'references/guide.md', content: '# guide\n' }]);
+		const manifestText = await import('node:fs/promises').then((fs) =>
+			fs.readFile(path.join(root, 'skills.json'), 'utf8')
+		);
+		expect(manifestText).not.toContain('"size"');
+
+		const catalog = await loadSkills(root);
+		expect(catalog.entries[0]!.resources.find((resource) => resource.uri.endsWith('/guide.md'))).toMatchObject({
+			size: Buffer.byteLength('# guide\n'),
+		});
+		expect(catalog.entries[0]!.resources.every((resource) => Number.isSafeInteger(resource.size))).toBe(true);
+	});
+
+	it('rejects a size mismatch exactly like a digest mismatch', async () => {
+		await writeSkills([{ name: 'alpha', withSize: true }]);
+		await mutateManifest((manifest) => {
+			const skills = manifest.skills as { resources: { uri: string; size: number }[] }[];
+			skills[0]!.resources.find((resource) => resource.uri.endsWith('/guide.md'))!.size += 1;
+		});
+		await expect(loadSkills(root)).rejects.toThrow(/size mismatch/u);
+
+		await writeSkills([{ name: 'alpha', withSize: true }]);
+		await mutateManifest((manifest) => {
+			const skills = manifest.skills as { resources: { size: unknown }[] }[];
+			skills[0]!.resources[0]!.size = '12';
+		});
+		await expect(loadSkills(root)).rejects.toThrow(/invalid size/u);
+
+		await writeSkills([{ name: 'alpha', withSize: true }]);
+		await mutateManifest((manifest) => {
+			const skills = manifest.skills as { resources: { size: unknown }[] }[];
+			skills[0]!.resources[0]!.size = -1;
+		});
+		await expect(loadSkills(root)).rejects.toThrow(/invalid size/u);
+	});
+
+	it('excludes a skill with more resources than the SEP-2640 limit and keeps the rest', async () => {
+		const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+		const tooMany = Array.from({ length: SKILL_MAX_RESOURCES }, (_, index) => ({
+			relativePath: `files/${index}.txt`,
+			content: `${index}`,
+		}));
+		await writeSkills([{ name: 'bloated', files: tooMany }, { name: 'alpha' }]);
+
+		const catalog = await loadSkills(root);
+		expect(catalog.entries.map((entry) => entry.uri)).toEqual(['skill://alpha/SKILL.md']);
+		expect(catalog.entriesByUri.has('skill://bloated/SKILL.md')).toBe(false);
+		expect(catalog.resourcesByUri.has('skill://bloated/SKILL.md')).toBe(false);
+		expect(catalog.directories.has('skill://bloated')).toBe(false);
+		expect(warn).toHaveBeenCalledWith(
+			expect.objectContaining({
+				skill: 'skill://bloated/SKILL.md',
+				reason: expect.stringContaining('resources exceeds'),
+			}),
+			expect.stringContaining('SEP-2640')
+		);
+	});
+
+	it('excludes a skill whose total size exceeds the SEP-2640 limit, from declared or verified sizes', async () => {
+		const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+		const huge = Buffer.alloc(SKILL_MAX_TOTAL_BYTES, 0x61);
+
+		// Declared sizes: excluded before any file is read.
+		await writeSkills([
+			{ name: 'huge', files: [{ relativePath: 'assets/big.bin', content: huge }], withSize: true },
+			{ name: 'alpha' },
+		]);
+		let catalog = await loadSkills(root);
+		expect(catalog.entries.map((entry) => entry.uri)).toEqual(['skill://alpha/SKILL.md']);
+		expect(catalog.resourcesByUri.has('skill://huge/assets/big.bin')).toBe(false);
+		expect(warn).toHaveBeenCalledWith(
+			expect.objectContaining({
+				skill: 'skill://huge/SKILL.md',
+				reason: expect.stringContaining('total bytes exceeds'),
+			}),
+			expect.stringContaining('SEP-2640')
+		);
+
+		// No declared sizes: excluded after verification, without failing the snapshot.
+		warn.mockClear();
+		await writeSkills([
+			{ name: 'huge', files: [{ relativePath: 'assets/big.bin', content: huge }] },
+			{ name: 'alpha' },
+		]);
+		catalog = await loadSkills(root);
+		expect(catalog.entries.map((entry) => entry.uri)).toEqual(['skill://alpha/SKILL.md']);
+		expect(catalog.resourcesByUri.has('skill://huge/assets/big.bin')).toBe(false);
+		expect(warn).toHaveBeenCalledTimes(1);
+
+		// Exactly at the limit is still served.
+		const atLimit = Buffer.alloc(
+			SKILL_MAX_TOTAL_BYTES - Buffer.byteLength('---\nname: exact\ndescription: first skill\n---\n\n# exact\n'),
+			0x62
+		);
+		await writeSkills([
+			{ name: 'exact', files: [{ relativePath: 'assets/big.bin', content: atLimit }], withSize: true },
+		]);
+		catalog = await loadSkills(root);
+		expect(catalog.entries.map((entry) => entry.uri)).toEqual(['skill://exact/SKILL.md']);
+		expect(catalog.entries[0]!.resources.reduce((sum, resource) => sum + resource.size, 0)).toBe(SKILL_MAX_TOTAL_BYTES);
 	});
 
 	it('retains verified bytes after the backing file changes', async () => {

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parseDocument } from 'yaml';
+import { logger } from '../utils/logger.js';
 import { DIRECTORY_MIME, mimeFor } from './skill-uri.js';
 import type {
 	ReadableSkillFile,
@@ -23,6 +24,9 @@ const MAX_SKILLS = 1_000;
 const MAX_RESOURCES = 10_000;
 const MAX_RESOURCE_BYTES = 25 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024;
+/** SEP-2640 per-skill limits: every conforming host accepts a skill up to these. */
+export const SKILL_MAX_RESOURCES = 512;
+export const SKILL_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 
 interface RawManifest {
 	skills?: unknown;
@@ -37,6 +41,14 @@ interface RawEntry {
 interface RawResource {
 	uri?: unknown;
 	digest?: unknown;
+	size?: unknown;
+}
+
+/** A manifest entry as declared in `skills.json`; `size` is verified when present and derived otherwise. */
+interface DeclaredResource {
+	uri: string;
+	digest: string;
+	size?: number;
 }
 
 interface ResolvedSkillUri {
@@ -206,16 +218,37 @@ function validateFrontmatter(value: unknown, skillName: string, uri: string): Sk
 function parseManifestResource(
 	raw: unknown,
 	rootDir: string
-): { manifest: SkillManifestResource; resolved: ResolvedSkillUri } {
+): { declared: DeclaredResource; resolved: ResolvedSkillUri } {
 	if (!isPlainObject(raw)) throw new Error('skill resource manifest entry must be an object');
 	const resource = raw as RawResource;
 	if (typeof resource.uri !== 'string' || typeof resource.digest !== 'string' || !DIGEST_RE.test(resource.digest)) {
 		throw new Error('skill resource manifest entry must contain a valid uri and SHA-256 digest');
 	}
+	if (resource.size !== undefined && (!Number.isSafeInteger(resource.size) || (resource.size as number) < 0)) {
+		throw new Error(`skill resource manifest entry has an invalid size: ${resource.uri}`);
+	}
 	return {
-		manifest: { uri: resource.uri, digest: resource.digest },
+		declared: {
+			uri: resource.uri,
+			digest: resource.digest,
+			...(resource.size === undefined ? {} : { size: resource.size as number }),
+		},
 		resolved: parseSkillUri(rootDir, resource.uri),
 	};
+}
+
+/**
+ * Returns a reason when a skill exceeds a SEP-2640 per-skill limit. Servers SHOULD NOT serve
+ * such a skill, so the loader excludes it from the catalog rather than failing the snapshot.
+ */
+function exceedsSkillLimits(resourceCount: number, totalBytes: number): string | null {
+	if (resourceCount > SKILL_MAX_RESOURCES) {
+		return `${resourceCount} resources exceeds the SEP-2640 limit of ${SKILL_MAX_RESOURCES}`;
+	}
+	if (totalBytes > SKILL_MAX_TOTAL_BYTES) {
+		return `${totalBytes} total bytes exceeds the SEP-2640 limit of ${SKILL_MAX_TOTAL_BYTES}`;
+	}
+	return null;
 }
 
 function addDirectoryChildren(
@@ -257,7 +290,7 @@ async function loadEntry(
 	directoryChildren: Map<string, Map<string, SkillDirChild>>,
 	retainedBytes: { value: number },
 	resourceCount: { value: number }
-): Promise<SkillEntry> {
+): Promise<SkillEntry | null> {
 	if (!isPlainObject(raw)) throw new Error('skill entry must be an object');
 	const rawEntry = raw as RawEntry;
 	if (typeof rawEntry.uri !== 'string' || !Array.isArray(rawEntry.resources)) {
@@ -266,6 +299,11 @@ async function loadEntry(
 	resourceCount.value += rawEntry.resources.length;
 	if (resourceCount.value > MAX_RESOURCES) {
 		throw new Error('skills manifest exceeds the maximum resource count');
+	}
+	const countLimit = exceedsSkillLimits(rawEntry.resources.length, 0);
+	if (countLimit) {
+		logger.warn({ skill: rawEntry.uri, reason: countLimit }, 'excluding skill that exceeds SEP-2640 limits');
+		return null;
 	}
 
 	const resolvedEntry = parseSkillUri(rootDir, rawEntry.uri);
@@ -278,34 +316,53 @@ async function loadEntry(
 	const skillRootParts = resolvedEntry.decodedParts.slice(0, -1);
 	const skillPath = skillRootParts.join('/');
 
+	const declaredResources = rawEntry.resources.map((rawResource) => parseManifestResource(rawResource, rootDir));
+	if (declaredResources.every(({ declared }) => declared.size !== undefined)) {
+		// Every entry declares a size, so the total limit is checkable before reading a single file,
+		// exactly as a host would check it from the entry alone.
+		const declaredTotal = declaredResources.reduce((sum, { declared }) => sum + (declared.size ?? 0), 0);
+		const sizeLimit = exceedsSkillLimits(declaredResources.length, declaredTotal);
+		if (sizeLimit) {
+			logger.warn({ skill: rawEntry.uri, reason: sizeLimit }, 'excluding skill that exceeds SEP-2640 limits');
+			return null;
+		}
+	}
+
 	const manifests: SkillManifestResource[] = [];
 	const seen = new Set<string>();
 	const manifestPaths = new Set<string>();
 	const loadedForEntry: ReadableSkillFile[] = [];
-	for (const rawResource of rawEntry.resources) {
-		const { manifest, resolved } = parseManifestResource(rawResource, rootDir);
-		if (seen.has(manifest.uri)) throw new Error(`duplicate skill resource URI: ${manifest.uri}`);
-		seen.add(manifest.uri);
+	const newlyLoaded = new Map<string, ReadableSkillFile>();
+	const bytesBefore = retainedBytes.value;
+	let totalBytes = 0;
+	for (const { declared, resolved } of declaredResources) {
+		if (seen.has(declared.uri)) throw new Error(`duplicate skill resource URI: ${declared.uri}`);
+		seen.add(declared.uri);
 
 		if (
 			resolved.decodedParts.length <= skillRootParts.length ||
 			skillRootParts.some((part, index) => resolved.decodedParts[index] !== part)
 		) {
-			throw new Error(`resource ${manifest.uri} is outside skill ${rawEntry.uri}`);
+			throw new Error(`resource ${declared.uri} is outside skill ${rawEntry.uri}`);
 		}
 
 		const resolvedPath = path.resolve(resolved.absPath);
 		if (manifestPaths.has(resolvedPath)) {
-			throw new Error(`multiple resource URIs resolve to the same file: ${manifest.uri}`);
+			throw new Error(`multiple resource URIs resolve to the same file: ${declared.uri}`);
 		}
 		manifestPaths.add(resolvedPath);
 
-		const existing = resourcesByUri.get(manifest.uri);
-		const bytes = existing?.bytes ?? (await readRegularFile(rootDir, resolved.absPath, manifest.uri, retainedBytes));
+		const existing = resourcesByUri.get(declared.uri) ?? newlyLoaded.get(declared.uri);
+		const bytes = existing?.bytes ?? (await readRegularFile(rootDir, resolved.absPath, declared.uri, retainedBytes));
 		const actualDigest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-		if (actualDigest !== manifest.digest) {
-			throw new Error(`digest mismatch for skill resource ${manifest.uri}`);
+		if (actualDigest !== declared.digest) {
+			throw new Error(`digest mismatch for skill resource ${declared.uri}`);
 		}
+		if (declared.size !== undefined && declared.size !== bytes.length) {
+			throw new Error(`size mismatch for skill resource ${declared.uri}`);
+		}
+		const manifest: SkillManifestResource = { uri: declared.uri, digest: declared.digest, size: bytes.length };
+		totalBytes += bytes.length;
 
 		const relativePath = resolved.decodedParts.slice(skillRootParts.length).join('/');
 		const { mimeType, isText: expectedText } = mimeFor(relativePath);
@@ -331,9 +388,18 @@ async function loadEntry(
 		if (existing && (existing.digest !== file.digest || !existing.bytes.equals(file.bytes))) {
 			throw new Error(`conflicting duplicate skill resource URI: ${file.uri}`);
 		}
-		resourcesByUri.set(file.uri, existing ?? file);
+		if (!existing) newlyLoaded.set(file.uri, file);
 		loadedForEntry.push(existing ?? file);
 		manifests.push(manifest);
+	}
+
+	const sizeLimit = exceedsSkillLimits(manifests.length, totalBytes);
+	if (sizeLimit) {
+		// Nothing from this skill has reached the shared maps yet, so excluding it only means
+		// releasing the bytes it alone accounted for.
+		logger.warn({ skill: rawEntry.uri, reason: sizeLimit }, 'excluding skill that exceeds SEP-2640 limits');
+		retainedBytes.value = bytesBefore;
+		return null;
 	}
 
 	if (!seen.has(rawEntry.uri)) {
@@ -346,13 +412,14 @@ async function loadEntry(
 	) {
 		throw new Error(`resource manifest is incomplete for ${rawEntry.uri}`);
 	}
-	const skillMd = resourcesByUri.get(rawEntry.uri);
+	const skillMd = resourcesByUri.get(rawEntry.uri) ?? newlyLoaded.get(rawEntry.uri);
 	if (!skillMd) throw new Error(`missing loaded SKILL.md: ${rawEntry.uri}`);
 	const actualFrontmatter = parseActualFrontmatter(skillMd.bytes, rawEntry.uri);
 	if (!isDeepStrictEqual(actualFrontmatter, frontmatter)) {
 		throw new Error(`frontmatter mismatch for ${rawEntry.uri}`);
 	}
 
+	for (const [uri, file] of newlyLoaded) resourcesByUri.set(uri, file);
 	for (const file of loadedForEntry) addDirectoryChildren(directoryChildren, rawEntry.uri, file);
 	return { uri: rawEntry.uri, frontmatter, resources: manifests, skillPath };
 }
@@ -381,6 +448,7 @@ export async function loadSkills(rootDir: string, loadedAt = Date.now()): Promis
 
 	for (const raw of parsed.skills) {
 		const entry = await loadEntry(rootDir, raw, resourcesByUri, directoryChildren, retainedBytes, resourceCount);
+		if (!entry) continue;
 		if (entriesByUri.has(entry.uri)) throw new Error(`duplicate skill entry URI: ${entry.uri}`);
 		entries.push(entry);
 		entriesByUri.set(entry.uri, entry);

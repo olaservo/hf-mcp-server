@@ -9,7 +9,11 @@ import { z } from 'zod';
 import { loadSkills } from '../../src/server/skills/skill-loader.js';
 import { registerSkillResources } from '../../src/server/skills/skill-resources.js';
 import { RESOURCES_DIRECTORY_READ_METHOD } from '../../src/server/skills/skill-directory-schema.js';
-import { SKILLS_GET_METHOD, SKILLS_LIST_METHOD } from '../../src/server/skills/skill-method-schema.js';
+import {
+	SKILLS_GET_METHOD,
+	SKILLS_LIST_METHOD,
+	SkillEntrySchema,
+} from '../../src/server/skills/skill-method-schema.js';
 
 type ResourceContent = { uri: string; mimeType: string; text?: string; blob?: string };
 type ResourceHandler = () => Promise<{ contents: ResourceContent[] }>;
@@ -64,9 +68,9 @@ async function buildAlphaSkill(root: string): Promise<void> {
 					uri: 'skill://alpha/SKILL.md',
 					frontmatter: { name: 'alpha', description: 'first skill' },
 					resources: [
-						{ uri: 'skill://alpha/SKILL.md', digest: digest(skillMd) },
-						{ uri: 'skill://alpha/references/guide.md', digest: digest(guide) },
-						{ uri: 'skill://alpha/assets/raw.bin', digest: digest(binary) },
+						{ uri: 'skill://alpha/SKILL.md', digest: digest(skillMd), size: Buffer.byteLength(skillMd) },
+						{ uri: 'skill://alpha/references/guide.md', digest: digest(guide), size: Buffer.byteLength(guide) },
+						{ uri: 'skill://alpha/assets/raw.bin', digest: digest(binary), size: binary.length },
 					],
 				},
 			],
@@ -126,20 +130,40 @@ describe('registerSkillResources', () => {
 		registerSkillResources(server, catalog, { protocolVersion: '2026-07-28', ttlMs: 456_000 });
 
 		const list = requestHandlers.get(SKILLS_LIST_METHOD)!({}) as {
+			resultType: string;
 			skills: Record<string, unknown>[];
 			ttlMs: number;
 			cacheScope: string;
 		};
-		expect(list).toMatchObject({ ttlMs: 456_000, cacheScope: 'public' });
+		expect(list).toMatchObject({ resultType: 'complete', ttlMs: 456_000, cacheScope: 'public' });
 		expect(list.skills).toHaveLength(1);
 		expect(Object.keys(list.skills[0]!).sort()).toEqual(['frontmatter', 'resources', 'uri']);
+		const entry = SkillEntrySchema.parse(list.skills[0]);
+		expect(entry.resources.map((resource) => [resource.uri, resource.size])).toEqual([
+			['skill://alpha/SKILL.md', Buffer.byteLength('---\nname: alpha\ndescription: first skill\n---\n\n# alpha\n')],
+			['skill://alpha/references/guide.md', 8],
+			['skill://alpha/assets/raw.bin', 3],
+		]);
 
 		const get = requestHandlers.get(SKILLS_GET_METHOD)!({ uri: 'skill://alpha/SKILL.md' }) as {
+			resultType: string;
 			skill: Record<string, unknown>;
 		};
+		expect(get.resultType).toBe('complete');
 		expect(get.skill).toEqual(list.skills[0]);
 		expect(get).not.toHaveProperty('ttlMs');
-		expect(() => requestHandlers.get(SKILLS_GET_METHOD)!({ uri: 'skill://alpha/references/guide.md' })).toThrow();
+		try {
+			requestHandlers.get(SKILLS_GET_METHOD)!({ uri: 'skill://alpha/references/guide.md' });
+			throw new Error('expected skills/get of a non-skill URI to fail');
+		} catch (error) {
+			expect(error).toMatchObject({ code: ProtocolErrorCode.InvalidParams });
+		}
+		try {
+			requestHandlers.get(SKILLS_GET_METHOD)!({ uri: 'skill://missing/SKILL.md' });
+			throw new Error('expected skills/get of an unknown skill to fail');
+		} catch (error) {
+			expect(error).toMatchObject({ code: ProtocolErrorCode.InvalidParams });
+		}
 	});
 
 	it('serves the custom methods through the GA SDK protocol layer', async () => {
@@ -193,8 +217,12 @@ describe('registerSkillResources', () => {
 
 		const handler = requestHandlers.get(RESOURCES_DIRECTORY_READ_METHOD)!;
 		const rootListing = handler({ uri: 'skill://alpha' }) as {
+			resultType: string;
 			resources: { uri: string; mimeType: string }[];
+			nextCursor?: string;
 		};
+		expect(rootListing.resultType).toBe('complete');
+		expect(rootListing).not.toHaveProperty('nextCursor');
 		expect(rootListing.resources).toContainEqual({
 			uri: 'skill://alpha/references',
 			name: 'references',
@@ -203,6 +231,12 @@ describe('registerSkillResources', () => {
 		try {
 			handler({ uri: 'skill://alpha/SKILL.md' });
 			throw new Error('expected directory read to fail');
+		} catch (error) {
+			expect(error).toMatchObject({ code: ProtocolErrorCode.InvalidParams });
+		}
+		try {
+			handler({ uri: 'skill://missing' });
+			throw new Error('expected directory read of an unknown URI to fail');
 		} catch (error) {
 			expect(error).toMatchObject({ code: ProtocolErrorCode.InvalidParams });
 		}
