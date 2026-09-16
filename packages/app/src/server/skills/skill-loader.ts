@@ -300,11 +300,6 @@ async function loadEntry(
 	if (resourceCount.value > MAX_RESOURCES) {
 		throw new Error('skills manifest exceeds the maximum resource count');
 	}
-	const countLimit = exceedsSkillLimits(rawEntry.resources.length, 0);
-	if (countLimit) {
-		logger.warn({ skill: rawEntry.uri, reason: countLimit }, 'excluding skill that exceeds SEP-2640 limits');
-		return null;
-	}
 
 	const resolvedEntry = parseSkillUri(rootDir, rawEntry.uri);
 	if (resolvedEntry.decodedParts.at(-1) !== SKILL_MD || resolvedEntry.decodedParts.length < 2) {
@@ -316,16 +311,23 @@ async function loadEntry(
 	const skillRootParts = resolvedEntry.decodedParts.slice(0, -1);
 	const skillPath = skillRootParts.join('/');
 
+	// An excluded skill contributes nothing to the snapshot, so its resources no longer count
+	// toward the manifest-wide bound either.
+	const exclude = (reason: string): null => {
+		logger.warn({ skill: rawEntry.uri, reason }, 'excluding skill that exceeds SEP-2640 limits');
+		resourceCount.value -= rawEntry.resources.length;
+		return null;
+	};
+	const countLimit = exceedsSkillLimits(rawEntry.resources.length, 0);
+	if (countLimit) return exclude(countLimit);
+
 	const declaredResources = rawEntry.resources.map((rawResource) => parseManifestResource(rawResource, rootDir));
 	if (declaredResources.every(({ declared }) => declared.size !== undefined)) {
 		// Every entry declares a size, so the total limit is checkable before reading a single file,
 		// exactly as a host would check it from the entry alone.
 		const declaredTotal = declaredResources.reduce((sum, { declared }) => sum + (declared.size ?? 0), 0);
 		const sizeLimit = exceedsSkillLimits(declaredResources.length, declaredTotal);
-		if (sizeLimit) {
-			logger.warn({ skill: rawEntry.uri, reason: sizeLimit }, 'excluding skill that exceeds SEP-2640 limits');
-			return null;
-		}
+		if (sizeLimit) return exclude(sizeLimit);
 	}
 
 	const manifests: SkillManifestResource[] = [];
@@ -397,9 +399,8 @@ async function loadEntry(
 	if (sizeLimit) {
 		// Nothing from this skill has reached the shared maps yet, so excluding it only means
 		// releasing the bytes it alone accounted for.
-		logger.warn({ skill: rawEntry.uri, reason: sizeLimit }, 'excluding skill that exceeds SEP-2640 limits');
 		retainedBytes.value = bytesBefore;
-		return null;
+		return exclude(sizeLimit);
 	}
 
 	if (!seen.has(rawEntry.uri)) {
