@@ -46,6 +46,7 @@ import {
 	type ToolResult,
 	VIEW_PARAMETERS,
 	CREATE_REPO_TOOL_ID,
+	memoizeJsonSchemaConversion,
 } from '@llmindset/hf-mcp';
 
 import type { ServerFactory, ServerFactoryResult, ServerRequestContext } from './transport/base-transport.js';
@@ -149,6 +150,28 @@ function prepareHfFsBatchExecution(
 }
 
 // Bouquet configurations moved to tool-selection-strategy.ts
+
+/** Shared so the conversion cache survives across requests, unlike an inline `z.object({})`. */
+const NO_PARAMETERS_SCHEMA = z.object({});
+
+/**
+ * Caches the JSON Schema conversion of every schema registered on `server`, the largest
+ * single cost in the request path. Hooking `registerTool` reaches every registration
+ * without touching each site.
+ *
+ * The cache lives on the schema instance, so it is process-wide: only schemas reused
+ * across requests benefit. Dynamic Gradio tools do not yet — `gradio-endpoint-connector.ts`
+ * rebuilds their `z.object` per request.
+ */
+function cacheRegisteredSchemaConversions(server: McpServer): void {
+	const register = server.registerTool.bind(server) as (...args: unknown[]) => unknown;
+	server.registerTool = ((...args: unknown[]) => {
+		const config = args[1] as { inputSchema?: unknown; outputSchema?: unknown } | undefined;
+		memoizeJsonSchemaConversion(config?.inputSchema);
+		memoizeJsonSchemaConversion(config?.outputSchema);
+		return register(...args);
+	}) as typeof server.registerTool;
+}
 
 /**
  * Creates request-scoped MCP servers containing only the tools selected for that request.
@@ -317,6 +340,8 @@ export const createServerFactory = (sharedApiClient: McpApiClient): ServerFactor
 			}
 		);
 
+		cacheRegisteredSchemaConversions(server);
+
 		const disabledTools = parseDisabledTools();
 		const selectedToolIds = new Set(toolSelection.enabledToolIds);
 		const shouldRegisterSelectedTool = (toolName: string) =>
@@ -336,7 +361,7 @@ export const createServerFactory = (sharedApiClient: McpApiClient): ServerFactor
 				{
 					title: 'Hugging Face User Info',
 					description: whoDescription,
-					inputSchema: z.object({}),
+					inputSchema: NO_PARAMETERS_SCHEMA,
 					outputSchema: hfWhoamiOutputSchema,
 					annotations: {
 						title: 'Hugging Face User Info',

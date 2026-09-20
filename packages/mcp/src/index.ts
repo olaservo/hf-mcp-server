@@ -19,6 +19,7 @@ export * from './space/dynamic-space-tool.js';
 export * from './space/utils/gradio-caller.js';
 export * from './space/utils/gradio-schema.js';
 export * from './network/url-policy.js';
+export * from './schema-cache.js';
 
 // Export shared types
 export * from './types/tool-result.js';

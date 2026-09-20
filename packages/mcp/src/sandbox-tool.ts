@@ -7,7 +7,15 @@ import { JobsApiClient } from './jobs/api-client.js';
 import type { JobInfo, JobSpec, JobStatus, JobVolume } from './jobs/types.js';
 import { parseTimeout, parseVolumes } from './jobs/commands/utils.js';
 import { fetchWithProfile, NETWORK_FETCH_PROFILES } from './network/fetch-profile.js';
+import { memoizeByKey } from './schema-cache.js';
 import { escapeMarkdown, formatBytes } from './utilities.js';
+
+/**
+ * Sandbox schemas vary only by the username in one field description (`handleDescription`),
+ * so they are cached per username. Each entry retains a whole zod tree (~35 KB), hence the
+ * small bound: three caches cost ~6.5 MB.
+ */
+const SANDBOX_CONFIG_CACHE_SIZE = 64;
 
 const SANDBOX_HANDLE_VERSION = 'hfsb2';
 const SANDBOX_PORT = 49983;
@@ -921,8 +929,13 @@ function parseStoredSandboxVolumes(job: JobInfo): JobVolume[] {
 }
 
 export class HfSandboxTool extends SandboxToolBase {
+	private static readonly configByUsername = memoizeByKey<string | undefined, SandboxToolConfig>(
+		(username) => ({ ...HF_SANDBOX_TOOL_CONFIG, schema: createSandboxSchema(username) }),
+		SANDBOX_CONFIG_CACHE_SIZE
+	);
+
 	static createToolConfig(username?: string): SandboxToolConfig {
-		return { ...HF_SANDBOX_TOOL_CONFIG, schema: createSandboxSchema(username) };
+		return HfSandboxTool.configByUsername(username);
 	}
 
 	async run(params: HfSandboxParams, options?: SandboxOptions): Promise<SandboxResult> {
@@ -1267,8 +1280,13 @@ export interface SandboxDetachResult {
 export type HfSandboxExecResult = SandboxExecResult | SandboxDetachResult;
 
 export class HfSandboxExecTool extends SandboxToolBase {
+	private static readonly configByUsername = memoizeByKey<string | undefined, SandboxExecToolConfig>(
+		(username) => ({ ...HF_SANDBOX_EXEC_TOOL_CONFIG, schema: createSandboxExecSchema(username) }),
+		SANDBOX_CONFIG_CACHE_SIZE
+	);
+
 	static createToolConfig(username?: string): SandboxExecToolConfig {
-		return { ...HF_SANDBOX_EXEC_TOOL_CONFIG, schema: createSandboxExecSchema(username) };
+		return HfSandboxExecTool.configByUsername(username);
 	}
 
 	async run(params: HfSandboxExecParams, options?: SandboxExecOptions): Promise<HfSandboxExecResult> {
@@ -1443,8 +1461,13 @@ export type SandboxFsResult =
 	| { op: 'mkdir'; path: string; created: true };
 
 export class HfSandboxFsTool extends SandboxToolBase {
+	private static readonly configByUsername = memoizeByKey<string | undefined, SandboxFsToolConfig>(
+		(username) => ({ ...HF_SANDBOX_FS_TOOL_CONFIG, schema: createSandboxFsSchema(username) }),
+		SANDBOX_CONFIG_CACHE_SIZE
+	);
+
 	static createToolConfig(username?: string): SandboxFsToolConfig {
-		return { ...HF_SANDBOX_FS_TOOL_CONFIG, schema: createSandboxFsSchema(username) };
+		return HfSandboxFsTool.configByUsername(username);
 	}
 
 	async run(params: HfSandboxFsParams): Promise<SandboxFsResult> {
