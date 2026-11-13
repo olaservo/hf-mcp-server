@@ -13,6 +13,9 @@ export const JOB_STATUS_CHANGED = 'job.status_changed';
 const NOT_FOUND = -32023;
 const FORBIDDEN = -32024;
 
+// Core transport code for a routing header that disagrees with the body.
+export const HEADER_MISMATCH = -32020;
+
 const TERMINAL_STAGES = new Set(['COMPLETED', 'CANCELED', 'ERROR', 'DELETED']);
 const ACTIVE_POLL_MS = 15_000;
 // A finished job cannot change stage again, so slow the client right down.
@@ -79,6 +82,22 @@ interface RegisterJobEventsOptions {
 	/** Test seam; defaults to the Hub Jobs API. */
 	jobs?: JobStatusReader;
 	now?: () => Date;
+}
+
+/**
+ * SEP-3415 requires `Mcp-Name` to equal `params.name` on events/poll. The SDK checks
+ * this header only for its own name-bearing methods, so the transport calls this.
+ * Returns a reason when the request must be rejected with 400 HeaderMismatch.
+ */
+export function eventsNameHeaderMismatch(body: unknown, header: string | string[] | undefined): string | null {
+	const request = body as { method?: unknown; params?: { name?: unknown } } | undefined;
+	const name = request?.params?.name;
+	// A missing or non-string name is the handler's InvalidParams, not a header problem.
+	if (request?.method !== EVENTS_POLL_METHOD || typeof name !== 'string') return null;
+	if (typeof header !== 'string' || !header) return 'Mcp-Name header is required for events/poll';
+	const encoded = /^=\?base64\?(.*)\?=$/.exec(header);
+	const value = encoded ? Buffer.from(encoded[1] ?? '', 'base64').toString('utf8') : header;
+	return value === name ? null : 'Mcp-Name header does not match params.name';
 }
 
 /** Events are opt-in while the extension is experimental. */

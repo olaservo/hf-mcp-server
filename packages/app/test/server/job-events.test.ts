@@ -4,6 +4,7 @@ import { HfApiError } from '@llmindset/hf-mcp';
 import {
 	EVENTS_LIST_METHOD,
 	EVENTS_POLL_METHOD,
+	eventsNameHeaderMismatch,
 	JOB_STATUS_CHANGED,
 	jobEventsEnabled,
 	registerJobEvents,
@@ -71,6 +72,18 @@ describe('job events', () => {
 		expect(supportsEventsProtocol(undefined)).toBe(false);
 		expect(supportsEventsProtocol('2025-11-25')).toBe(false);
 		expect(supportsEventsProtocol('2026-07-28')).toBe(true);
+	});
+
+	it('requires Mcp-Name to match the event name on events/poll only', () => {
+		const poll = { method: EVENTS_POLL_METHOD, params: { name: JOB_STATUS_CHANGED } };
+		expect(eventsNameHeaderMismatch(poll, JOB_STATUS_CHANGED)).toBeNull();
+		const encoded = `=?base64?${Buffer.from(JOB_STATUS_CHANGED).toString('base64')}?=`;
+		expect(eventsNameHeaderMismatch(poll, encoded)).toBeNull();
+		expect(eventsNameHeaderMismatch(poll, undefined)).toMatch(/required/);
+		expect(eventsNameHeaderMismatch(poll, 'job.deleted')).toMatch(/does not match/);
+		expect(eventsNameHeaderMismatch({ method: EVENTS_LIST_METHOD, params: {} }, undefined)).toBeNull();
+		expect(eventsNameHeaderMismatch({ method: EVENTS_POLL_METHOD, params: {} }, undefined)).toBeNull();
+		expect(eventsNameHeaderMismatch({ method: 'tools/call', params: { name: 'x' } }, undefined)).toBeNull();
 	});
 
 	it('lists one poll-only event type', () => {

@@ -36,7 +36,13 @@ import {
 	ResourcesDirectoryReadParamsSchema,
 } from '../skills/skill-directory-schema.js';
 import { SKILLS_GET_METHOD, SKILLS_LIST_METHOD } from '../skills/skill-method-schema.js';
-import { EVENTS_LIST_METHOD, EVENTS_POLL_METHOD } from '../events/job-events.js';
+import {
+	EVENTS_LIST_METHOD,
+	EVENTS_POLL_METHOD,
+	HEADER_MISMATCH,
+	eventsNameHeaderMismatch,
+	jobEventsEnabled,
+} from '../events/job-events.js';
 import { getProxyToolsConfig } from '../utils/proxy-tools-config.js';
 import { BOUQUET_FALLBACK } from '../../shared/settings.js';
 import {
@@ -886,6 +892,19 @@ export class StatelessHttpTransport extends BaseTransport {
 			const statusCode = authResult.statusCode || 401;
 			if (statusCode === 401) res.set('WWW-Authenticate', buildOAuthResourceHeader(req));
 			res.status(statusCode).send(statusCode === 503 ? 'Service Unavailable' : 'Unauthorized');
+			return;
+		}
+
+		const nameHeaderMismatch = jobEventsEnabled()
+			? eventsNameHeaderMismatch(requestBody, req.headers['mcp-name'])
+			: null;
+		if (nameHeaderMismatch) {
+			this.trackMethodCall(trackingName, startTime, true, clientInfo, { era: 'modern', version: protocolVersion });
+			res.status(400).json({
+				jsonrpc: '2.0',
+				id: (requestBody as { id?: string | number } | undefined)?.id ?? null,
+				error: { code: HEADER_MISMATCH, message: 'HeaderMismatch', data: { reason: nameHeaderMismatch } },
+			});
 			return;
 		}
 
