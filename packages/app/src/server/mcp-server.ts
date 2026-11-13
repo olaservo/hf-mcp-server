@@ -58,6 +58,7 @@ import type { AppSettings } from '../shared/settings.js';
 import { extractAuthBouquetAndMix } from './utils/auth-utils.js';
 import { ToolSelectionStrategy, type ToolSelectionContext } from './utils/tool-selection-strategy.js';
 import { registerCapabilities } from './utils/capability-utils.js';
+import { jobEventsEnabled, registerJobEvents, supportsEventsProtocol } from './events/job-events.js';
 import { applyResultPostProcessing, type GradioToolCallOptions } from './utils/gradio-tool-caller.js';
 import { registerSkillResources } from './skills/skill-resources.js';
 import { isClientDenied } from '../shared/client-denylist.js';
@@ -979,6 +980,13 @@ export const createServerFactory = (sharedApiClient: McpApiClient): ServerFactor
 			});
 		}
 
+		// Experimental SEP-3415 events: poll-only job status, for authenticated callers.
+		const hasEvents =
+			jobEventsEnabled() && !!hfToken && !clientDenied && supportsEventsProtocol(sessionInfo?.protocolVersion);
+		if (hasEvents && hfToken) {
+			registerJobEvents(server, { hfToken, username });
+		}
+
 		logger.info(
 			{
 				mode: toolSelection.mode,
@@ -991,6 +999,7 @@ export const createServerFactory = (sharedApiClient: McpApiClient): ServerFactor
 
 		registerCapabilities(server, {
 			hasSkills,
+			hasEvents,
 		});
 
 		finalizeDefinitionTags();

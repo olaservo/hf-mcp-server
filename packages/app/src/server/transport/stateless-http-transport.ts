@@ -36,6 +36,7 @@ import {
 	ResourcesDirectoryReadParamsSchema,
 } from '../skills/skill-directory-schema.js';
 import { SKILLS_GET_METHOD, SKILLS_LIST_METHOD } from '../skills/skill-method-schema.js';
+import { EVENTS_LIST_METHOD, EVENTS_POLL_METHOD } from '../events/job-events.js';
 import { getProxyToolsConfig } from '../utils/proxy-tools-config.js';
 import { BOUQUET_FALLBACK } from '../../shared/settings.js';
 import {
@@ -71,7 +72,16 @@ const RESOURCE_METHODS = new Set([
 	RESOURCES_DIRECTORY_READ_METHOD,
 ]);
 const SKILL_METHODS = new Set([SKILLS_LIST_METHOD, SKILLS_GET_METHOD]);
-const FULL_SERVER_METHODS = new Set(['tools/list', 'tools/call', 'initialize', ...RESOURCE_METHODS, ...SKILL_METHODS]);
+// Experimental SEP-3415 methods. The full server registers them only when events are enabled.
+const EVENT_METHODS = new Set([EVENTS_LIST_METHOD, EVENTS_POLL_METHOD]);
+const FULL_SERVER_METHODS = new Set([
+	'tools/list',
+	'tools/call',
+	'initialize',
+	...RESOURCE_METHODS,
+	...SKILL_METHODS,
+	...EVENT_METHODS,
+]);
 // Resource-subscription methods we never support (skills are static — nothing to
 // notify `resources/updated` about). Rejected cheaply before any server is built.
 const UNSUPPORTED_SUBSCRIBE_METHODS = new Set(['resources/subscribe', 'resources/unsubscribe']);
@@ -491,7 +501,10 @@ export class StatelessHttpTransport extends BaseTransport {
 			// Denied clients (e.g. cursor-vscode flooding the resource surface) get no
 			// resources: route their resource list/read to the stub responder so the
 			// full Skills server is never built for them.
-			if ((RESOURCE_METHODS.has(method) || SKILL_METHODS.has(method)) && isClientDenied(clientName, userAgent)) {
+			if (
+				(RESOURCE_METHODS.has(method) || SKILL_METHODS.has(method) || EVENT_METHODS.has(method)) &&
+				isClientDenied(clientName, userAgent)
+			) {
 				return false;
 			}
 			return true;
